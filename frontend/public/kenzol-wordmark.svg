@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 20 1240 470" role="img" aria-labelledby="t">
+  <title id="t">Kenzol</title>
+  <defs>
+    <linearGradient id="kz-plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset=".55" stop-color="#eceded"/>
+      <stop offset="1" stop-color="#c4c6c9"/>
+    </linearGradient>
+    <linearGradient id="kz-top" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2a1416" stop-opacity="0"/>
+      <stop offset=".35" stop-color="#b3141c"/>
+      <stop offset=".62" stop-color="#e2262d"/>
+      <stop offset="1" stop-color="#f7941d"/>
+    </linearGradient>
+    <linearGradient id="kz-bottom" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f7941d"/>
+      <stop offset=".45" stop-color="#e2262d"/>
+      <stop offset=".8" stop-color="#7a0f14"/>
+      <stop offset="1" stop-color="#2a1416" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="kz-gear" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f1f2f3"/>
+      <stop offset=".5" stop-color="#b9bcc0"/>
+      <stop offset="1" stop-color="#7d8086"/>
+    </linearGradient>
+    <radialGradient id="kz-core" cx=".38" cy=".32" r=".8">
+      <stop offset="0" stop-color="#ffc56b"/>
+      <stop offset=".45" stop-color="#f7941d"/>
+      <stop offset="1" stop-color="#c8161e"/>
+    </radialGradient>
+    <linearGradient id="kz-drop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#e2262d"/>
+    </linearGradient>
+    <path id="kz-letters" d="M0 120h46v80l96-80h66l-114 94 118 106h-68l-98-90v90H0z M232 120h168v40H278v40h104v40H278v40h122v40H232z M424 120h46l92 134V120h46v200h-46l-92-134v134h-46z M636 120h178v38L696 282h118v38H636v-38l118-124H636z M1036 120h46v160h112v40h-158z"/>
+  </defs>
+
+  <!-- silver plate -->
+  <ellipse cx="620" cy="235" rx="595" ry="198" fill="url(#kz-plate)" stroke="#b7babe" stroke-width="3" transform="rotate(-4 620 235)"/>
+  <!-- brand swooshes -->
+  <path d="M260 58 A600 222 0 0 1 1168 150 A600 150 0 0 0 260 58Z" fill="url(#kz-top)"/>
+  <path d="M36 280 A600 222 0 0 0 860 466 A600 150 0 0 1 36 280Z" fill="url(#kz-bottom)"/>
+
+  <!-- gear "O" -->
+  <g transform="translate(915 222)">
+    <g fill="url(#kz-gear)" stroke="#6f7278" stroke-width="2">
+      <path d="M-14 -104h28l4 22 20 8 18-13 20 20-13 18 8 20 22 4v28l-22 4-8 20 13 18-20 20-18-13-20 8-4 22h-28l-4-22-20-8-18 13-20-20 13-18-8-20-22-4v-28l22-4 8-20-13-18 20-20 18 13 20-8z" transform="scale(1.04)"/>
+    </g>
+    <circle r="62" fill="#141416"/>
+    <circle r="54" fill="url(#kz-core)"/>
+    <path d="M-34 -30 A46 46 0 0 1 18 -44 A60 60 0 0 0 -30 2 Z" fill="#fff" opacity=".85"/>
+  </g>
+
+  <!-- wordmark: K E N Z _ L (italic) -->
+  <g transform="translate(110 4) skewX(-14)">
+    <use href="#kz-letters" fill="none" stroke="#8d9095" stroke-width="22" stroke-linejoin="round"/>
+    <use href="#kz-letters" fill="none" stroke="#ffffff" stroke-width="10" stroke-linejoin="round"/>
+    <use href="#kz-letters" fill="#141416"/>
+  </g>
+
+  <!-- oil drop -->
+  <path transform="translate(915 222)" d="M-112 74 C-100 96 -88 108 -88 124 A24 24 0 0 1 -136 124 C-136 108 -124 96 -112 74Z" fill="url(#kz-drop)" stroke="#fff" stroke-width="4"/>
+
+  <text x="1176" y="74" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#444">TM</text>
+</svg>
