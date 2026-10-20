@@ -20,7 +20,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 API_KEY = os.getenv("SAFECUBE_API", "").strip()
 PROVIDER_URL = "https://api.sinay.ai/container-tracking/api/v2/shipment"
 SEALINES_URL = "https://api.sinay.ai/container-tracking/api/v2/sealines"
-EXCEL_FILE_SETTING = os.getenv("EXCEL_FILE", "CUSTOMS EXIT WITH EST .xlsx").strip()
+EXCEL_FILE_SETTING = os.getenv("EXCEL_FILE", "customs_exit_with_est.xlsx").strip()
 EXCEL_PATH = Path(EXCEL_FILE_SETTING)
 if not EXCEL_PATH.is_absolute():
     EXCEL_PATH = PROJECT_ROOT / EXCEL_PATH
