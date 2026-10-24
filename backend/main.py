@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 import tempfile
 from copy import copy
 from datetime import date, datetime, timezone
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 # Load the project-root .env: kenzol-demo/.env, not backend/.env.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -104,8 +106,8 @@ def route_location(route: Any, key: str) -> str:
         return ""
     item = route.get(key)
     if isinstance(item, dict):
-        # Prefer the canonical location name, but tolerate other provider shapes.
-        return location_name(item) or clean_text(item.get("name"))
+        # Route points nest the place under "location"; tolerate flat shapes too.
+        return location_name(item.get("location")) or location_name(item)
     return clean_text(item)
 
 
@@ -144,16 +146,20 @@ def normalize_provider_response(data: dict[str, Any], requested_bl: str) -> dict
     metadata = data.get("metadata") or {}
     route = data.get("route") or {}
 
-    # Route fields may be absent depending on provider coverage or route settings.
+    # The provider lists every place on the journey in order: the first is the origin and
+    # the last is the destination. Route points are the fallback when the list is missing.
+    journey = [name for name in (location_name(item) for item in data.get("locations") or []) if name]
     origin = (
-        route_location(route, "pol")
+        (journey[0] if journey else "")
         or route_location(route, "prepol")
         or route_location(route, "prePol")
+        or route_location(route, "pol")
     )
     destination = (
-        route_location(route, "pod")
+        (journey[-1] if journey else "")
         or route_location(route, "postpod")
         or route_location(route, "postPod")
+        or route_location(route, "pod")
     )
 
     raw_containers = data.get("containers") or []
@@ -423,6 +429,18 @@ def route_field(route: Any, *keys: str) -> Any:
     return None
 
 
+def save_workbook(workbook: Any) -> None:
+    """Save via a temporary file, then atomically replace the workbook."""
+    fd, temp_name = tempfile.mkstemp(prefix=EXCEL_PATH.stem + "_", suffix=".xlsx", dir=EXCEL_PATH.parent)
+    os.close(fd)
+    try:
+        workbook.save(temp_name)
+        os.replace(temp_name, EXCEL_PATH)
+    finally:
+        if os.path.exists(temp_name):
+            os.remove(temp_name)
+
+
 @app.post("/api/update-excel")
 async def update_excel(
     bl_number: str = Query(..., min_length=5, max_length=80),
@@ -546,15 +564,7 @@ async def update_excel(
                     if name in ("VESSEL ETD", "VESSEL ETA") and isinstance(value, str):
                         cell.number_format = "DD/MM/YYYY"
 
-        parent = EXCEL_PATH.parent
-        fd, temp_name = tempfile.mkstemp(prefix=EXCEL_PATH.stem + "_", suffix=".xlsx", dir=parent)
-        os.close(fd)
-        try:
-            workbook.save(temp_name)
-            os.replace(temp_name, EXCEL_PATH)
-        finally:
-            if os.path.exists(temp_name):
-                os.remove(temp_name)
+        save_workbook(workbook)
 
         return {
             "success": True,
@@ -683,3 +693,286 @@ async def download_excel() -> FileResponse:
         filename=f"{EXCEL_PATH.stem}_{stamp}.xlsx",
         headers={"Cache-Control": "no-store"},
     )
+
+
+# Workbook columns shown in the Shipment summary view. CHEQUE AMOUNT is created on first save.
+SUMMARY_COLUMNS = ["EST NUMBER", "Exit No", "Agent Name", "VESSEL ETA", "CHEQUE AMOUNT"]
+CHEQUE_AMOUNT_HEADER = "CHEQUE AMOUNT"
+
+
+def bl_tokens(value: Any) -> set[str]:
+    """A BL cell may hold several references, e.g. 'DXB1015984C/DXB1015984D'."""
+    whole = normalize_bl(value)
+    tokens = {normalize_bl(part) for part in re.split(r"[/,;]+", str(value or ""))}
+    return {token for token in tokens | {whole} if token not in BL_PLACEHOLDERS}
+
+
+def load_workbook_or_raise(**kwargs: Any) -> Any:
+    require_workbook()
+    try:
+        return openpyxl.load_workbook(EXCEL_PATH, **kwargs)
+    except PermissionError:
+        raise HTTPException(status_code=423, detail="The Excel workbook is locked. Close it in Excel and try again.")
+    except Exception as exc:
+        logger.warning("Could not open workbook: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Could not open the Excel workbook. Check that it is a valid .xlsx file.")
+
+
+def main_sheet(workbook: Any) -> Any:
+    return workbook["Sheet1"] if "Sheet1" in workbook.sheetnames else workbook.active
+
+
+@app.get("/api/shipment-summary")
+async def shipment_summary(
+    bl_numbers: str = Query(..., min_length=5, max_length=4000, description="Comma-separated BL numbers"),
+) -> dict[str, Any]:
+    """Return the customs/agent fields recorded in the workbook for each requested BL."""
+    requested = list(dict.fromkeys(
+        normalize_bl(part) for part in bl_numbers.split(",") if normalize_bl(part)
+    ))
+    if not requested:
+        raise HTTPException(status_code=422, detail="Enter at least one BL number.")
+
+    workbook = load_workbook_or_raise(read_only=True, data_only=True)
+    try:
+        sheet = main_sheet(workbook)
+        rows_iter = sheet.iter_rows(values_only=True)
+        headers = next(rows_iter, ()) or ()
+        header_map = {
+            str(header).strip().casefold(): index
+            for index, header in enumerate(headers)
+            if isinstance(header, str) and header.strip()
+        }
+        bl_index = header_map.get("bl number")
+        if bl_index is None:
+            raise HTTPException(status_code=400, detail="Could not find a 'BL NUMBER' column in the Excel workbook.")
+
+        # A BL often spans several rows (one per exit). Merge them into one record per BL,
+        # keeping each column's distinct values in row order.
+        matches = {bl: {"bl": bl, "rows": [], "values": {name: [] for name in SUMMARY_COLUMNS}} for bl in requested}
+        for row_number, values in enumerate(rows_iter, start=2):
+            if bl_index >= len(values):
+                continue
+            tokens = bl_tokens(values[bl_index])
+            for bl in requested:
+                if bl not in tokens:
+                    continue
+                matches[bl]["rows"].append(row_number)
+                for name in SUMMARY_COLUMNS:
+                    index = header_map.get(name.casefold())
+                    value = excel_value(values[index]) if index is not None and index < len(values) else None
+                    merged = matches[bl]["values"][name]
+                    if value is not None and value != "" and value not in merged:
+                        merged.append(value)
+    finally:
+        workbook.close()
+
+    return {
+        "fileName": EXCEL_PATH.name,
+        "columns": SUMMARY_COLUMNS,
+        "shipments": [matches[bl] for bl in requested],
+    }
+
+
+def read_header_map(sheet: Any) -> tuple[dict[str, int], int]:
+    """Map casefolded headers to 1-based columns; also return the last header column."""
+    header_map = {}
+    last_header_col = 0
+    for col in range(1, sheet.max_column + 1):
+        header = sheet.cell(1, col).value
+        if isinstance(header, str) and header.strip():
+            header_map[header.strip().casefold()] = col
+            last_header_col = col
+    return header_map, last_header_col
+
+
+def ensure_column(sheet: Any, header_map: dict[str, int], last_header_col: int, name: str, style_from: str = "") -> int:
+    """Return the column for `name`, adding it after the last header (styled like the headers) if missing."""
+    col = header_map.get(name.casefold())
+    if col:
+        return col
+    col = last_header_col + 1
+    header_cell = sheet.cell(1, col)
+    header_cell.value = name
+    style_source = sheet.cell(1, header_map.get(style_from.casefold()) or last_header_col)
+    if style_source.has_style:
+        header_cell._style = copy(style_source._style)
+    header_map[name.casefold()] = col
+    return col
+
+
+class ChequeAmountUpdate(BaseModel):
+    bl: str = Field(..., min_length=1, max_length=80)
+    amount: float | None = None
+
+
+class ChequeAmountRequest(BaseModel):
+    updates: list[ChequeAmountUpdate] = Field(..., min_length=1, max_length=500)
+
+
+@app.post("/api/shipment-summary/cheque-amounts")
+async def save_cheque_amounts(payload: ChequeAmountRequest) -> dict[str, Any]:
+    """Write manually entered cheque amounts into the CHEQUE AMOUNT column."""
+    workbook = load_workbook_or_raise()
+    try:
+        sheet = main_sheet(workbook)
+        header_map, last_header_col = read_header_map(sheet)
+
+        bl_col = header_map.get("bl number")
+        if not bl_col:
+            raise HTTPException(status_code=400, detail="Could not find a 'BL NUMBER' column in the Excel workbook.")
+
+        amount_col = ensure_column(sheet, header_map, last_header_col, CHEQUE_AMOUNT_HEADER, style_from="cheque number")
+
+        # The amount belongs to the BL, so it is written to every row that BL appears on,
+        # the same way update-excel treats duplicate BL rows.
+        amounts_by_bl = {normalize_bl(update.bl): update.amount for update in payload.updates}
+        amounts_by_row = {}
+        for row_num in range(2, sheet.max_row + 1):
+            for bl in bl_tokens(sheet.cell(row_num, bl_col).value) & amounts_by_bl.keys():
+                amounts_by_row[row_num] = amounts_by_bl[bl]
+        missing = amounts_by_bl.keys() - {
+            bl for row_num in amounts_by_row for bl in bl_tokens(sheet.cell(row_num, bl_col).value)
+        }
+        if missing:
+            raise HTTPException(status_code=404, detail=f"BL {', '.join(sorted(missing))} is not in the Excel register.")
+
+        for row_num, amount in amounts_by_row.items():
+            cell = sheet.cell(row_num, amount_col)
+            cell.value = amount
+            if amount is not None:
+                cell.number_format = "#,##0.00"
+
+        save_workbook(workbook)
+    except HTTPException:
+        raise
+    except PermissionError:
+        raise HTTPException(status_code=423, detail="Could not replace the Excel workbook. Close it in Excel and try again.")
+    except Exception:
+        logger.exception("Cheque amount update failed")
+        raise HTTPException(status_code=500, detail="Failed to save the Excel workbook. No success was reported.")
+    finally:
+        workbook.close()
+
+    return {
+        "success": True,
+        "fileName": EXCEL_PATH.name,
+        "rowsUpdated": sorted(amounts_by_row),
+    }
+
+
+# Shipments whose vessel ETA is this many days away (or less) need a payment request.
+PAYMENT_ALERT_DAYS = 15
+PAYMENT_STATUS_HEADER = "PAYMENT STATUS"
+PAYMENT_RECEIVED = "Received"
+
+
+def parse_eta(value: Any) -> date | None:
+    """Read workbook ETAs: real dates, ISO strings from the provider, or day-first text like 28/11/26."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = clean_text(value)
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text).date()
+    except ValueError:
+        pass
+    match = re.fullmatch(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2}|\d{4})", text)
+    if not match:
+        return None
+    day, month, year = (int(part) for part in match.groups())
+    try:
+        return date(year + 2000 if year < 100 else year, month, day)
+    except ValueError:
+        return None
+
+
+@app.get("/api/payment-alerts")
+async def payment_alerts() -> dict[str, Any]:
+    """List BLs arriving within PAYMENT_ALERT_DAYS (or already arrived) whose payment is not marked received."""
+    workbook = load_workbook_or_raise(read_only=True, data_only=True)
+    try:
+        rows_iter = main_sheet(workbook).iter_rows(values_only=True)
+        headers = next(rows_iter, ()) or ()
+        header_map = {
+            str(header).strip().casefold(): index
+            for index, header in enumerate(headers)
+            if isinstance(header, str) and header.strip()
+        }
+        bl_index = header_map.get("bl number")
+        eta_index = header_map.get("vessel eta")
+        if bl_index is None or eta_index is None:
+            raise HTTPException(status_code=400, detail="The Excel workbook needs 'BL NUMBER' and 'VESSEL ETA' columns.")
+        status_index = header_map.get(PAYMENT_STATUS_HEADER.casefold())
+
+        def cell(values: tuple, index: int | None) -> Any:
+            return values[index] if index is not None and index < len(values) else None
+
+        today = date.today()
+        alerts: dict[str, dict[str, Any]] = {}
+        received: set[str] = set()
+        for values in rows_iter:
+            bl = clean_text(cell(values, bl_index))
+            if not bl_tokens(bl):
+                continue
+            key = normalize_bl(bl)
+            if clean_text(cell(values, status_index)).casefold() == PAYMENT_RECEIVED.casefold():
+                received.add(key)
+                continue
+            eta = parse_eta(cell(values, eta_index))
+            if eta is None or (eta - today).days > PAYMENT_ALERT_DAYS:
+                continue
+            # A BL spans several rows; alert once, on its earliest ETA.
+            if key not in alerts or eta < date.fromisoformat(alerts[key]["eta"]):
+                alerts[key] = {
+                    "bl": bl,
+                    "eta": eta.isoformat(),
+                    "daysLeft": (eta - today).days,
+                    "consignee": clean_text(cell(values, header_map.get("consignee name"))),
+                    "shippingLine": clean_text(cell(values, header_map.get("shipping line"))),
+                }
+    finally:
+        workbook.close()
+
+    due = sorted((alert for key, alert in alerts.items() if key not in received), key=lambda alert: alert["eta"])
+    return {"thresholdDays": PAYMENT_ALERT_DAYS, "alerts": due}
+
+
+class PaymentReceivedRequest(BaseModel):
+    bl: str = Field(..., min_length=1, max_length=200)
+
+
+@app.post("/api/payment-alerts/received")
+async def mark_payment_received(payload: PaymentReceivedRequest) -> dict[str, Any]:
+    """Write 'Received' into PAYMENT STATUS on every row of the BL, which stops its alert."""
+    workbook = load_workbook_or_raise()
+    try:
+        sheet = main_sheet(workbook)
+        header_map, last_header_col = read_header_map(sheet)
+        bl_col = header_map.get("bl number")
+        if not bl_col:
+            raise HTTPException(status_code=400, detail="Could not find a 'BL NUMBER' column in the Excel workbook.")
+        status_col = ensure_column(sheet, header_map, last_header_col, PAYMENT_STATUS_HEADER, style_from="cheque number")
+
+        target = bl_tokens(payload.bl)
+        rows = [row for row in range(2, sheet.max_row + 1) if bl_tokens(sheet.cell(row, bl_col).value) & target]
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"BL {payload.bl} is not in the Excel register.")
+        for row in rows:
+            sheet.cell(row, status_col).value = PAYMENT_RECEIVED
+
+        save_workbook(workbook)
+    except HTTPException:
+        raise
+    except PermissionError:
+        raise HTTPException(status_code=423, detail="Could not replace the Excel workbook. Close it in Excel and try again.")
+    except Exception:
+        logger.exception("Payment status update failed")
+        raise HTTPException(status_code=500, detail="Failed to save the Excel workbook. No success was reported.")
+    finally:
+        workbook.close()
+
+    return {"success": True, "fileName": EXCEL_PATH.name, "rowsUpdated": rows}

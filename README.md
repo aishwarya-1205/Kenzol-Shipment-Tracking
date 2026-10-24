@@ -83,7 +83,11 @@ Carrier values accepted by the backend: `MSC`, `Hapag-Lloyd`, `CMA CGM`, `Maersk
 POST /api/update-excel?bl_number=...   # write tracking data into the workbook
 GET  /api/excel                        # workbook summary + register rows (Excel register view)
 GET  /api/excel/download               # download the current workbook (.xlsx)
+GET  /api/shipment-summary?bl_numbers=A,B        # EST no., exit no., agent, vessel ETA, cheque amount per BL
+POST /api/shipment-summary/cheque-amounts        # body: {"updates": [{"bl": "...", "amount": 1250.5}]}
 ```
+
+The Shipment summary tab writes cheque amounts to a `CHEQUE AMOUNT` column, which is added to the workbook the first time an amount is saved.
 
 ## Important carrier-code note
 

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Anchor, ArrowLeft, ArrowRight, ArrowUpRight, ArrowsClockwise, Boat, Bookmarks,
+  Anchor, ArrowLeft, ArrowRight, ArrowUpRight, ArrowsClockwise, Bell, Boat, Bookmarks,
   CalendarBlank, CaretDown, CheckCircle, Clock, ClockCounterClockwise, Cube,
-  DownloadSimple, FileXls, MagnifyingGlass, MapPin, Path, ShieldCheck, Table, Truck,
+  DownloadSimple, FileXls, MagnifyingGlass, MapPin, Path, PencilSimple, ShieldCheck, Table, Truck,
   WarningCircle, X
 } from "@phosphor-icons/react";
 import { scrollToElement, scrollToTop } from "./smoothScroll.js";
@@ -17,6 +17,10 @@ const CARRIERS = [
 ];
 
 const RECENT_KEY = "kenzol-recent";
+const SUMMARY_KEY = "kenzol-summary-bls";
+// BL -> local date ("YYYY-MM-DD") on which "Not yet" was clicked; the BL is asked about again the next day.
+const PAYMENT_SNOOZE_KEY = "kenzol-payment-snooze";
+const PAYMENT_CHECK_MS = 60 * 60 * 1000;
 const EXCEL_DOWNLOAD_URL = "/api/excel/download";
 
 // Register columns shown in the Excel view, mapped to the workbook headers.
@@ -30,6 +34,10 @@ const REGISTER_TABLE = [
   { key: "VESSEL ETD", label: "ETD", date: true },
   { key: "VESSEL ETA", label: "ETA", date: true }
 ];
+
+const AMOUNT_FORMAT = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const VIEW_LABELS = { track: "Track shipment", summary: "Shipment summary", excel: "Excel register" };
 
 function readField(obj, keys, fallback = "—") {
   for (const key of keys) {
@@ -47,6 +55,24 @@ function formatDate(value, fallback = "Date unavailable") {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return String(value);
   return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric" }).format(parsed);
+}
+
+// Like formatDate, but keeps the provider's time of day when one is given.
+function formatDateTime(value, fallback) {
+  const date = formatDate(value, fallback);
+  const match = /^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})/.exec(String(value || ""));
+  return match && `${match[1]}:${match[2]}` !== "00:00" ? `${date} · ${match[1]}:${match[2]}` : date;
+}
+
+function splitBls(text) {
+  return text.split(/[\s,;]+/).map((part) => part.trim().toUpperCase()).filter((part) => part.length >= 5);
+}
+
+// Blank means "no amount"; otherwise a non-negative number, commas allowed as separators.
+function parseAmount(text) {
+  const cleaned = String(text ?? "").replace(/,/g, "").trim();
+  if (!cleaned) return null;
+  return /^\d+(\.\d{1,2})?$/.test(cleaned) ? Number(cleaned) : NaN;
 }
 
 function timeAgo(value) {
@@ -129,6 +155,11 @@ function routeProgress(shipment) {
   if (code.includes("PLANNED")) return 0.08;
   return 0;
 }
+
+const API_BASE_URL = (
+  import.meta.env.VITE_API_URL ||
+  "http://127.0.0.1:8000"
+).replace(/\/+$/, "");
 
 async function apiRequest(url, options) {
   let response;
@@ -224,10 +255,11 @@ function CarrierSelect({ id, value, onChange }) {
 
 /* ---------- Layout ---------- */
 
-function Sidebar({ view, onNavigate, excelCount }) {
+function Sidebar({ view, onNavigate, excelCount, summaryCount }) {
   const items = [
-    { id: "track", label: "Track shipment", icon: MagnifyingGlass },
-    { id: "excel", label: "Excel register", icon: FileXls, badge: excelCount }
+    { id: "track", label: VIEW_LABELS.track, icon: MagnifyingGlass },
+    { id: "summary", label: VIEW_LABELS.summary, icon: Bookmarks, badge: summaryCount },
+    { id: "excel", label: VIEW_LABELS.excel, icon: FileXls, badge: excelCount }
   ];
   return (
     <aside className="sidebar">
@@ -250,11 +282,6 @@ function Sidebar({ view, onNavigate, excelCount }) {
             {badge ? <span className="nav-badge">{badge}</span> : null}
           </button>
         ))}
-        <div className="nav-item is-disabled" aria-disabled="true">
-          <Bookmarks size={19} />
-          <span className="nav-text">Saved shipments</span>
-          <span className="soon-tag">Soon</span>
-        </div>
       </nav>
 
       <div className="sidebar-foot">
@@ -282,7 +309,7 @@ function Topbar({ view, health }) {
       <div className="crumbs">
         <span>Workspace</span>
         <span className="crumb-sep">/</span>
-        <strong>{view === "excel" ? "Excel register" : "Track shipment"}</strong>
+        <strong>{VIEW_LABELS[view]}</strong>
       </div>
       <div className="topbar-right">
         <HealthBadge health={health} />
@@ -754,10 +781,375 @@ function ExcelView({ excel, onReload, onTrackBl, onSync, savingExcel, notice, on
   );
 }
 
+/* ---------- Shipment summary view ---------- */
+
+function EtaCell({ entry }) {
+  if (!entry || entry.loading) return <span className="eta-pending"><Spinner size={13} /> Fetching…</span>;
+  if (entry.error) return <span className="nil" title={entry.error}>Unavailable</span>;
+  return entry.eta ? formatDateTime(entry.eta) : <span className="nil">—</span>;
+}
+
+function SummaryView({ bls, onAddBls, onRemoveBl, etas, onRefreshEtas, onTrackBl, onOpenRegister }) {
+  const [input, setInput] = useState("");
+  const [summary, setSummary] = useState({ data: null, loading: false, error: "" });
+  const [drafts, setDrafts] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState(null);
+
+  const loadSummary = useCallback(async () => {
+    if (!bls.length) {
+      setSummary({ data: null, loading: false, error: "" });
+      return;
+    }
+    setSummary((prev) => ({ ...prev, loading: true, error: "" }));
+    try {
+      const params = new URLSearchParams({ bl_numbers: bls.join(",") });
+      const data = await apiRequest(`/api/shipment-summary?${params.toString()}`);
+      setSummary({ data, loading: false, error: "" });
+    } catch (err) {
+      setSummary((prev) => ({ ...prev, loading: false, error: err.message }));
+    }
+  }, [bls]);
+
+  useEffect(() => { loadSummary(); }, [loadSummary]);
+  useReveal([summary.data]);
+
+  // One row per BL; the backend merges the BL's workbook rows into lists of distinct values.
+  const tableRows = useMemo(() => {
+    const byBl = new Map((summary.data?.shipments || []).map((item) => [item.bl, item]));
+    return bls.map((bl) => {
+      const match = byBl.get(bl);
+      const values = match?.values || {};
+      return {
+        bl,
+        values,
+        inRegister: Boolean(match?.rows.length),
+        missing: Boolean(match && !match.rows.length),
+        savedAmount: values["CHEQUE AMOUNT"]?.[0] ?? null
+      };
+    });
+  }, [bls, summary.data]);
+
+  const changes = tableRows
+    .filter((item) => item.inRegister && item.bl in drafts && parseAmount(drafts[item.bl]) !== item.savedAmount)
+    .map((item) => ({ bl: item.bl, amount: parseAmount(drafts[item.bl]) }));
+  const invalid = changes.some((change) => Number.isNaN(change.amount));
+
+  function stopEditing(blList) {
+    setDrafts((prev) => {
+      const next = { ...prev };
+      blList.forEach((bl) => delete next[bl]);
+      return next;
+    });
+  }
+
+  async function saveAmounts(updates = changes) {
+    if (!updates.length || updates.some((update) => Number.isNaN(update.amount))) return;
+    setSaving(true);
+    setNotice(null);
+    try {
+      const payload = await apiRequest("/api/shipment-summary/cheque-amounts", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ updates })
+      });
+      setNotice({
+        type: "success",
+        title: updates.length === 1 ? `Cheque amount saved for BL ${updates[0].bl}` : `Saved ${updates.length} cheque amounts to Excel`,
+        text: `${payload.fileName ?? "Workbook"} · row ${(payload.rowsUpdated || []).join(", ")}`
+      });
+      await loadSummary();
+      stopEditing(updates.map((update) => update.bl));
+    } catch (err) {
+      setNotice({ type: "error", text: err.message || "Could not save cheque amounts." });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function onAmountKeyDown(event, item) {
+    if (event.key === "Escape") {
+      stopEditing([item.bl]);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const amount = parseAmount(drafts[item.bl]);
+      if (amount === item.savedAmount) stopEditing([item.bl]);
+      else saveAmounts([{ bl: item.bl, amount }]);
+    }
+  }
+
+  function addFromInput(event) {
+    event.preventDefault();
+    const next = splitBls(input);
+    if (!next.length) return;
+    onAddBls(next);
+    setInput("");
+  }
+
+  return (
+    <section className="excel-view">
+      <div className="results-head reveal">
+        <div>
+          <span className="eyebrow"><span className="eyebrow-bar" />Workspace · Summary</span>
+          <h1 className="page-title">Shipment summary</h1>
+          <p className="page-sub">Customs and agent details from the Excel register for every BL you add, with the latest arrival estimate from the carrier.</p>
+        </div>
+        <div className="results-actions">
+          <button className="btn btn-secondary" onClick={() => { loadSummary(); onRefreshEtas(); }} disabled={summary.loading || !bls.length}>
+            {summary.loading ? <Spinner /> : <ArrowsClockwise size={16} />} Refresh
+          </button>
+          <button className="btn btn-excel" onClick={() => saveAmounts()} disabled={saving || !changes.length || invalid}>
+            {saving ? <Spinner /> : <FileXls size={17} weight="fill" />}
+            {saving ? "Updating Excel…" : `Update in Excel${changes.length ? ` (${changes.length})` : ""}`}
+          </button>
+        </div>
+      </div>
+
+      <ExcelNotice notice={notice} onDismiss={() => setNotice(null)} onOpenRegister={onOpenRegister} />
+
+      <form className="sync-card summary-add reveal" onSubmit={addFromInput}>
+        <div className="sync-copy">
+          <h3>Add BL numbers</h3>
+          <p>Paste one or several, separated by commas, spaces or new lines.</p>
+        </div>
+        <div className="field">
+          <MagnifyingGlass size={18} className="field-icon" />
+          <input value={input} onChange={(event) => setInput(event.target.value)} placeholder="e.g. MEDUH9197102, DXB1014423" aria-label="BL numbers to add" autoComplete="off" spellCheck="false" />
+        </div>
+        <button type="submit" className="btn btn-primary" disabled={!splitBls(input).length}>
+          Add to summary <ArrowRight size={16} weight="bold" />
+        </button>
+      </form>
+
+      {summary.error && (
+        <div className="panel empty-inline is-error reveal">
+          <WarningCircle size={22} />
+          <div><strong>Could not load the summary</strong><p>{summary.error}</p></div>
+        </div>
+      )}
+
+      <div className="panel table-panel reveal">
+        <div className="table-scroll">
+          <table className="register">
+            <thead>
+              <tr>
+                <th>BL number</th>
+                <th>EST number</th>
+                <th>Est. arrival</th>
+                <th>Exit number</th>
+                <th>Cheque amount</th>
+                <th>Agent name</th>
+                <th>Vessel ETA</th>
+                <th aria-label="Actions" />
+              </tr>
+            </thead>
+            <tbody>
+              {tableRows.map((item) => {
+                const editing = item.inRegister && (item.bl in drafts || item.savedAmount === null);
+                const text = drafts[item.bl] ?? "";
+                const parsed = parseAmount(text);
+                const cell = (key, date) => {
+                  const list = item.values[key] || [];
+                  if (!list.length) return <span className="nil">—</span>;
+                  return list.map((value) => <span className="cell-line" key={value}>{date ? formatDate(value, "") : String(value)}</span>);
+                };
+                return (
+                  <tr key={item.bl}>
+                    <td className="mono">
+                      {item.bl}
+                      {item.missing && <span className="chip summary-missing">Not in register</span>}
+                    </td>
+                    <td>{cell("EST NUMBER")}</td>
+                    <td><EtaCell entry={etas[item.bl]} /></td>
+                    <td>{cell("Exit No")}</td>
+                    <td>
+                      {!item.inRegister ? <span className="nil">—</span> : editing ? (
+                        <input
+                          className={`amount-input ${parsed !== item.savedAmount && text !== "" ? "is-dirty" : ""} ${Number.isNaN(parsed) ? "is-invalid" : ""}`}
+                          value={text}
+                          inputMode="decimal"
+                          placeholder="0.00"
+                          autoFocus={item.bl in drafts && item.savedAmount !== null}
+                          disabled={saving}
+                          aria-label={`Cheque amount for BL ${item.bl}. Press Enter to save.`}
+                          title="Press Enter to save, Esc to cancel"
+                          onChange={(event) => setDrafts((prev) => ({ ...prev, [item.bl]: event.target.value }))}
+                          onKeyDown={(event) => onAmountKeyDown(event, item)}
+                        />
+                      ) : (
+                        <span className="amount-saved">
+                          {AMOUNT_FORMAT.format(item.savedAmount)}
+                          <button
+                            className="icon-button amount-edit"
+                            onClick={() => setDrafts((prev) => ({ ...prev, [item.bl]: String(item.savedAmount) }))}
+                            aria-label={`Edit cheque amount for BL ${item.bl}`}
+                            title="Edit"
+                          >
+                            <PencilSimple size={14} />
+                          </button>
+                        </span>
+                      )}
+                    </td>
+                    <td>{cell("Agent Name")}</td>
+                    <td>{cell("VESSEL ETA", true)}</td>
+                    <td className="col-action">
+                      <button className="row-action" onClick={() => onTrackBl(item.bl)} aria-label={`Track ${item.bl}`}>
+                        Track <ArrowUpRight size={14} />
+                      </button>
+                      <button className="row-action" onClick={() => onRemoveBl(item.bl)} aria-label={`Remove ${item.bl} from summary`}>
+                        <X size={14} />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {!bls.length && (
+            <div className="empty-inline table-empty">
+              <Bookmarks size={22} />
+              <div><strong>No shipments yet</strong><p>Add BL numbers above to build your summary. The list is kept in this browser.</p></div>
+            </div>
+          )}
+        </div>
+        <div className="table-foot">
+          <span>{bls.length} BL{bls.length === 1 ? "" : "s"} · press Enter in a cheque amount to save it</span>
+          {invalid && <span className="summary-invalid">Cheque amounts must be numbers with up to 2 decimals.</span>}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/* ---------- Payment alerts ---------- */
+
+function localDay(date = new Date()) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function readSnoozes() {
+  try { return JSON.parse(localStorage.getItem(PAYMENT_SNOOZE_KEY) || "{}"); }
+  catch { return {}; }
+}
+
+function arrivalText(daysLeft) {
+  if (daysLeft > 1) return `arrives in ${daysLeft} days`;
+  if (daysLeft === 1) return "arrives tomorrow";
+  if (daysLeft === 0) return "arrives today";
+  return `arrived ${-daysLeft} day${daysLeft === -1 ? "" : "s"} ago`;
+}
+
+/* Asks for payment on every BL arriving within the threshold until it is marked received.
+   "Not yet" hides a BL for the rest of the day; the popup returns the next day. */
+function PaymentAlerts() {
+  const [alerts, setAlerts] = useState([]);
+  const [threshold, setThreshold] = useState(15);
+  const [busyBl, setBusyBl] = useState("");
+  const [error, setError] = useState("");
+
+  const check = useCallback(async () => {
+    try {
+      const data = await apiRequest("/api/payment-alerts");
+      const snoozes = readSnoozes();
+      const today = localDay();
+      setThreshold(data.thresholdDays);
+      setAlerts(data.alerts.filter((alert) => snoozes[alert.bl] !== today));
+    } catch {
+      // The alert is a reminder only; a failed check is retried on the next interval.
+    }
+  }, []);
+
+  useEffect(() => {
+    check();
+    const id = setInterval(check, PAYMENT_CHECK_MS);
+    return () => clearInterval(id);
+  }, [check]);
+
+  function dismiss(bl) {
+    setAlerts((prev) => prev.filter((alert) => alert.bl !== bl));
+  }
+
+  function notYet(bl) {
+    const today = localDay();
+    // Drop snoozes from earlier days so the stored map stays small.
+    const kept = Object.fromEntries(Object.entries(readSnoozes()).filter(([, day]) => day === today));
+    try { localStorage.setItem(PAYMENT_SNOOZE_KEY, JSON.stringify({ ...kept, [bl]: today })); } catch { /* storage unavailable */ }
+    dismiss(bl);
+  }
+
+  async function received(bl) {
+    setBusyBl(bl);
+    setError("");
+    try {
+      await apiRequest("/api/payment-alerts/received", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ bl })
+      });
+      dismiss(bl);
+    } catch (err) {
+      setError(err.message || "Could not save the payment status.");
+    } finally {
+      setBusyBl("");
+    }
+  }
+
+  if (!alerts.length) return null;
+  return (
+    <div className="modal-backdrop">
+      <div className="modal" role="alertdialog" aria-modal="true" aria-labelledby="payment-title">
+        <div className="modal-head">
+          <span className="tile tile-brand"><Bell size={20} weight="fill" /></span>
+          <div>
+            <h2 id="payment-title">{alerts.length === 1 ? "Shipment arriving soon" : `${alerts.length} shipments arriving soon`}</h2>
+            <p>Arrival is {threshold} days away or less. Request payment from the consignee.</p>
+          </div>
+        </div>
+
+        <ul className="payment-list">
+          {alerts.map((alert) => (
+            <li key={alert.bl} className="payment-item">
+              <div className="payment-info">
+                <strong className="mono">{alert.bl}</strong>
+                <span>
+                  {alert.consignee || "Consignee not recorded"}
+                  {alert.shippingLine ? ` · ${alert.shippingLine}` : ""}
+                </span>
+                <span className={`chip ${alert.daysLeft <= 3 ? "chip-urgent" : "chip-brand"}`}>
+                  <CalendarBlank size={13} /> {formatDate(alert.eta)} · {arrivalText(alert.daysLeft)}
+                </span>
+              </div>
+              <div className="payment-actions">
+                <button className="btn btn-secondary btn-sm" onClick={() => notYet(alert.bl)} disabled={busyBl === alert.bl}>
+                  Not yet
+                </button>
+                <button className="btn btn-excel btn-sm" onClick={() => received(alert.bl)} disabled={Boolean(busyBl)}>
+                  {busyBl === alert.bl ? <Spinner size={14} /> : <CheckCircle size={15} weight="fill" />} Payment received
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+
+        {error && (
+          <div className="inline-error" role="alert">
+            <WarningCircle size={18} weight="fill" />
+            <span>{error}</span>
+          </div>
+        )}
+        <p className="modal-foot">“Not yet” reminds you again tomorrow. “Payment received” is saved to the Excel register.</p>
+      </div>
+    </div>
+  );
+}
+
 /* ---------- App ---------- */
 
 export default function App() {
-  const [view, setView] = useState(() => (window.location.hash === "#excel" ? "excel" : "track"));
+  const [view, setView] = useState(() => {
+    const hash = window.location.hash.slice(1);
+    return hash in VIEW_LABELS ? hash : "track";
+  });
   const [blNumber, setBlNumber] = useState("");
   const [carrier, setCarrier] = useState("");
   const [shipment, setShipment] = useState(null);
@@ -775,9 +1167,43 @@ export default function App() {
     catch { return []; }
   });
 
+  const [summaryBls, setSummaryBls] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(SUMMARY_KEY) || "[]"); }
+    catch { return []; }
+  });
+  // Tracking lookups per BL, kept here so switching views does not re-query the provider.
+  const [etas, setEtas] = useState({});
+
   useEffect(() => {
     try { localStorage.setItem(RECENT_KEY, JSON.stringify(recent.slice(0, 5))); } catch { /* storage unavailable */ }
   }, [recent]);
+
+  useEffect(() => {
+    try { localStorage.setItem(SUMMARY_KEY, JSON.stringify(summaryBls)); } catch { /* storage unavailable */ }
+  }, [summaryBls]);
+
+  // Fetch the provider ETA for summary BLs that have not been looked up yet, a few at a time.
+  useEffect(() => {
+    if (view !== "summary") return;
+    const pending = summaryBls.filter((bl) => !etas[bl]);
+    if (!pending.length) return;
+    setEtas((prev) => Object.fromEntries([...Object.entries(prev), ...pending.map((bl) => [bl, { loading: true }])]));
+    const queue = [...pending];
+    const worker = async () => {
+      while (queue.length) {
+        const bl = queue.shift();
+        let entry;
+        try {
+          const payload = await apiRequest(`/api/track?${new URLSearchParams({ bl_number: bl }).toString()}`);
+          entry = { eta: normalizeResponse(payload, bl, "").eta };
+        } catch (err) {
+          entry = { error: err.message };
+        }
+        setEtas((prev) => (prev[bl] ? { ...prev, [bl]: entry } : prev));
+      }
+    };
+    Array.from({ length: Math.min(3, pending.length) }, worker);
+  }, [view, summaryBls, etas]);
 
   useEffect(() => {
     fetch("/api/health").then((r) => (r.ok ? r.json() : false)).then(setHealth).catch(() => setHealth(false));
@@ -800,7 +1226,7 @@ export default function App() {
   function navigate(next) {
     if (next === view) return;
     setView(next);
-    window.history.replaceState(null, "", next === "excel" ? "#excel" : "#");
+    window.history.replaceState(null, "", next === "track" ? "#" : `#${next}`);
     scrollToTop({ immediate: true });
     if (next === "excel") loadExcel();
   }
@@ -877,7 +1303,7 @@ export default function App() {
 
   return (
     <div className="app">
-      <Sidebar view={view} onNavigate={navigate} excelCount={excel.data?.trackedRecords} />
+      <Sidebar view={view} onNavigate={navigate} excelCount={excel.data?.trackedRecords} summaryCount={summaryBls.length} />
 
       <main className="main">
         <Topbar view={view} health={health} />
@@ -920,6 +1346,19 @@ export default function App() {
                 )}
               </div>
             </>
+          ) : view === "summary" ? (
+            <SummaryView
+              bls={summaryBls}
+              onAddBls={(next) => setSummaryBls((prev) => [...new Set([...prev, ...next])])}
+              onRemoveBl={(bl) => {
+                setSummaryBls((prev) => prev.filter((item) => item !== bl));
+                setEtas(({ [bl]: _removed, ...rest }) => rest);
+              }}
+              etas={etas}
+              onRefreshEtas={() => setEtas({})}
+              onTrackBl={trackFromRegister}
+              onOpenRegister={() => navigate("excel")}
+            />
           ) : (
             <ExcelView
               excel={excel}
@@ -939,6 +1378,8 @@ export default function App() {
           </footer>
         </div>
       </main>
+
+      <PaymentAlerts />
     </div>
   );
 }
