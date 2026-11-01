@@ -72,8 +72,9 @@ p { margin: 0; }
   transition: width 0.18s ease;
 }
 .sidebar.is-collapsed { width: var(--sidebar-collapsed); }
-.brand { min-height: 36px; padding: 0 6px; margin-bottom: 20px; display: flex; align-items: center; }
-.brand-logo { width: 168px; height: auto; display: block; }
+.brand { min-height: 36px; padding: 0 4px; margin-bottom: 20px; display: flex; align-items: center; }
+/* Full sidebar width so the tagline under the logo stays readable. */
+.brand-logo { width: 100%; max-width: 204px; height: auto; display: block; }
 .brand-mark { width: 28px; height: 28px; display: block; }
 
 .nav { display: flex; flex-direction: column; gap: 2px; }

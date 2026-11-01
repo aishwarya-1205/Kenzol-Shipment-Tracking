@@ -35,7 +35,7 @@ function Sidebar({ route, onNavigate, collapsed: collapsedSetting, onToggle, mob
       {mobileOpen && <div className="scrim" onClick={onCloseMobile} />}
       <aside className={`sidebar ${collapsed ? "is-collapsed" : ""} ${mobileOpen ? "is-open" : ""}`}>
         <div className="brand">
-          {collapsed ? <img src="/kenzol-mark.svg" alt="Kenzol" className="brand-mark" /> : <img src="/kenzol-logo.png" alt="Kenzol" className="brand-logo" />}
+          {collapsed ? <img src="/kenzol-mark.svg" alt="Kenzol" className="brand-mark" /> : <img src="/kenzol-logo-tagline.png" alt="Kenzol, Powering Motion Worldwide" className="brand-logo" />}
         </div>
         <nav className="nav" aria-label="Main">
           {items.map(({ view, label, icon: Icon, children }) => {
