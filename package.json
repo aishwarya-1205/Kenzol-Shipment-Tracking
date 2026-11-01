@@ -11,7 +11,7 @@
     "import": "node scripts/import-xlsx.mjs"
   },
   "dependencies": {
-    "fflate": "^0.8.2"
+    "fflate": "^0.8.3"
   },
   "devDependencies": {
     "wrangler": "^4.0.0",
