@@ -128,7 +128,7 @@ export function NotificationPopup({ data, onChanged, onOpenRow }) {
         <header className="modal-head">
           <div>
             <h2 id="popup-title">{items.length === 1 ? "1 item needs attention" : `${items.length} items need attention`}</h2>
-            <p className="muted">Shipments arriving and cheque refunds due within {data.thresholdDays} days.</p>
+            <p className="muted">Shipments arriving and Payments due within {data.thresholdDays} days.</p>
           </div>
           <button className="icon-btn" onClick={() => setClosed(true)} aria-label="Close"><X size={16} /></button>
         </header>
