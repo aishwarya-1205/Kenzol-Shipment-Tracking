@@ -1,109 +1,78 @@
-# Kenzol - Shipping Tracking Backend
+# Kenzol - Shipping Tracking
 
-FastAPI backend for the React/Vite frontend in `frontend/`. The backend reads `SAFECUBE_API` from the project-root `.env` file and calls the SafeCube/Sinay Container Tracking API.
+Shipment register and Bill of Lading tracking, hosted on Cloudflare.
 
-## 1. Expected project layout
+- `worker/index.ts`: Cloudflare Worker serving the `/api/*` endpoints and the built frontend.
+- `frontend/`: React/Vite app (built into `frontend/dist`, served by the Worker).
+- D1 database `kenzol`: the shipment register (`schema.sql`). Each workbook row is stored as JSON keyed by its Excel header.
+- `shared/dates.mjs`: date parsing used by the Worker and the scripts. Register dates are stored as `YYYY-MM-DD`.
+- Tracking data comes from the SafeCube/Sinay Container Tracking API.
 
-```text
-kenzol-demo/
-├── backend/
-│   ├── main.py
-│   └── requirements.txt
-├── frontend/
-│   ├── src/
-│   ├── package.json
-│   └── vite.config.js
-├── venv/
-└── .env
+## Secrets
+
+The API key lives in Cloudflare, never in the frontend:
+
+```powershell
+npx wrangler secret put SAFECUBE_API
+npx wrangler secret put MCL_SCAC   # optional, only with a verified MCL sealine code
 ```
 
-The `.env` file should be in the `kenzol-demo` root, one level above `backend/`:
+For local development, put the same values in a root `.env` (not committed):
 
 ```env
 SAFECUBE_API=your_real_api_key_here
 ```
 
-Do not commit `.env` to Git. Do not put the API key in React/Vite variables such as `VITE_SAFECUBE_API`.
-
-## 2. Install dependencies (Windows PowerShell)
-
-From the `kenzol-demo` project root:
+## Local development
 
 ```powershell
-.\venv\Scripts\Activate.ps1
-python -m pip install -r .\backend\requirements.txt
+npm install
+npm run dev                 # Worker + local D1 on http://127.0.0.1:8787
+cd frontend; npm run dev    # optional: Vite with hot reload, proxies /api to 8787
 ```
 
-If you do not have a virtual environment yet:
+`wrangler dev` uses a local copy of D1, which starts empty. Load data with
+`npx wrangler d1 execute kenzol --local --file=schema.sql` and then a seed file.
+
+If wrangler says the compatibility date is newer than its runtime, add `--compatibility-date=2026-05-01` for local runs.
+
+## Deploy
 
 ```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-python -m pip install -r .\backend\requirements.txt
+npm run build    # builds frontend/dist
+npm run deploy   # wrangler deploy
 ```
 
-## 3. Start the backend
+## Register data
 
-From the project root:
+- `node scripts/import-xlsx.mjs backend/data/customs_exit_with_est.xlsx seed.sql` builds a fresh seed from the workbook.
+  **The seed wipes the tables**, including edits made in the app (cheque amounts, refund dates, telex and payment status).
+- `scripts/fix-dates.mjs` repairs date cells in the live database in place, without losing app edits (usage at the top of the file).
+- Keep `backend/data/` out of git (it holds the workbook and database backups).
 
-```powershell
-python -m uvicorn main:app --app-dir backend --reload --host 127.0.0.1 --port 8000
-```
-
-Then check:
-- Health: http://127.0.0.1:8000/api/health
-- API docs: http://127.0.0.1:8000/docs
-- Verified carrier/sealine list from provider: http://127.0.0.1:8000/api/sealines
-
-Keep this terminal open.
-
-## 4. Start the frontend in another terminal
-
-```powershell
-cd frontend
-npm run dev
-```
-
-Open the Vite URL printed in the terminal, usually http://localhost:5173.
-
-The included Vite proxy should forward `/api/*` calls to `http://127.0.0.1:8000`.
-
-## API endpoint used by the frontend
+## API
 
 ```http
-GET /api/track?bl_number=YOUR_BL_NUMBER
-GET /api/track?bl_number=YOUR_BL_NUMBER&carrier=Maersk
+GET  /api/health
+GET  /api/carriers
+GET  /api/track?bl_number=...&carrier=...    # carrier optional: MSC, Hapag-Lloyd, CMA CGM, Maersk, MCL
+GET  /api/sealines                           # provider's official sealine codes
+GET  /api/shipments                          # dashboard rows
+POST /api/shipments/update                   # {"row": 457, "fields": {"telexStatus": "Released"}}
+GET  /api/notifications                      # arrivals and cheque refunds due within 15 days
+GET  /api/excel[?view=all]                   # raw register
+GET  /api/excel/download[?format=csv]        # .xlsx (dates as real dd/mm/yyyy cells) or CSV
+POST /api/update-excel?bl_number=...         # sync carrier data into the register
+POST /api/register/delete                    # {"rows": [12]} or {"bl": "..."}
 ```
 
-Carrier values accepted by the backend: `MSC`, `Hapag-Lloyd`, `CMA CGM`, `Maersk`, and `MCL` only when `MCL_SCAC` is configured with a verified code. Leaving the carrier blank enables provider auto-detection.
-
-## Excel endpoints
-
-```http
-POST /api/update-excel?bl_number=...   # write tracking data into the workbook
-GET  /api/excel                        # workbook summary + register rows (Excel register view)
-GET  /api/excel/download               # download the current workbook (.xlsx)
-GET  /api/shipment-summary?bl_numbers=A,B        # EST no., exit no., agent, vessel ETA, cheque amount per BL
-POST /api/shipment-summary/cheque-amounts        # body: {"updates": [{"bl": "...", "amount": 1250.5}]}
-```
-
-The Shipment summary tab writes cheque amounts to a `CHEQUE AMOUNT` column, which is added to the workbook the first time an amount is saved.
-
-## Important carrier-code note
-
-The API expects the provider's 4-letter sealine/SCAC code. Defaults in `main.py` are MSCU, HLCU, CMDU and MAEU. MCL's code is intentionally not guessed. Use `/api/sealines` to check the provider's official list; if you verify the right code, add it to the root `.env`:
-
-```env
-MCL_SCAC=VERIFIED_CODE
-```
-
-Restart the backend after changing `.env`.
+Editable fields for `/api/shipments/update`: `chequeAmount`, `refundDate`, `refundStatus` (per row) and
+`telexStatus`, `paymentStatus` (applied to every row sharing the BL).
 
 ## Troubleshooting
 
-- `SAFECUBE_API is missing`: confirm the variable is in the root `.env`, spelled exactly `SAFECUBE_API`, then restart the backend.
-- `401/403`: check that the key is valid and has access to Container Tracking API.
+- `SAFECUBE_API is missing`: set the secret (see above) and redeploy, or add it to `.env` for local runs.
+- `401/403`: check the key is valid and has access to the Container Tracking API.
 - `429`: wait before retrying; avoid repeated requests for the same BL.
 - No results: verify the BL and try Auto-detect if a carrier was selected.
-- If the frontend cannot connect, make sure both terminals are running and Vite's proxy points to port 8000.
-- Shipment data is only as fresh as the provider/carrier data. Refreshing does not guarantee live GPS updates.
+- Tracking data is only as fresh as the carrier's published events; it is not live GPS.

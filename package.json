@@ -1,0 +1,20 @@
+{
+  "name": "kenzol-shipment-tracking",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm --prefix frontend install && npm --prefix frontend run build",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:schema": "wrangler d1 execute kenzol --remote --file=schema.sql",
+    "db:seed": "wrangler d1 execute kenzol --remote --file=seed.sql",
+    "import": "node scripts/import-xlsx.mjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "xlsx": "^0.18.5"
+  }
+}

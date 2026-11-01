@@ -1,0 +1,24 @@
+{
+  "name": "kenzol-shipment-tracking",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-10-01",
+
+  "assets": {
+    "directory": "./frontend/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "kenzol",
+      "database_id": "b43d75cc-f9e7-43f0-9623-d73d91d5abd5"
+    }
+  ],
+
+  "vars": {
+    "APP_TIMEZONE": "Asia/Kolkata"
+  }
+}
